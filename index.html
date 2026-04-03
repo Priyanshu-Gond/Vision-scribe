@@ -1,0 +1,284 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import {
+  getAuth,
+  signInAnonymously,
+  signInWithCustomToken,
+  onAuthStateChanged
+} from 'firebase/auth';
+import {
+  getFirestore,
+  collection,
+  doc,
+  setDoc,
+  onSnapshot,
+  query,
+  updateDoc,
+  getDoc
+} from 'firebase/firestore';
+
+// ✅ SAFE Firebase config
+const firebaseConfig = typeof __firebase_config !== "undefined"
+  ? JSON.parse(__firebase_config)
+  : {
+      apiKey: "YOUR_KEY",
+      authDomain: "YOUR_DOMAIN",
+      projectId: "YOUR_PROJECT_ID"
+    };
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'vision-scribe-v1';
+
+// 🔴 IMPORTANT: ADD YOUR GEMINI KEY
+const apiKey = "YOUR_GEMINI_API_KEY";
+
+const XP_PER_LEVEL = 100;
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [userData, setUserData] = useState(null);
+  const [leaderboard, setLeaderboard] = useState([]);
+  const [view, setView] = useState('dashboard');
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  // ✅ AUTH FIXED
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) {
+        console.error("Auth Error:", e);
+      }
+    };
+
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, async (u) => {
+      setUser(u);
+
+      if (u) {
+        try {
+          const userRef = doc(db, 'artifacts', appId, 'users', u.uid, 'profile', 'stats');
+          const snap = await getDoc(userRef);
+
+          if (!snap.exists()) {
+            setShowOnboarding(true);
+          } else {
+            setUserData(snap.data());
+            setShowOnboarding(false);
+          }
+        } catch (err) {
+          console.error("User fetch error:", err);
+        }
+      }
+
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // ✅ DATA LISTENERS FIXED
+  useEffect(() => {
+    if (!user || showOnboarding) return;
+
+    const userRef = doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'stats');
+
+    const unsubUser = onSnapshot(userRef, (docSnap) => {
+      if (docSnap.exists()) setUserData(docSnap.data());
+    });
+
+    const globalRef = collection(db, 'artifacts', appId, 'public', 'data', 'leaderboard');
+
+    const unsubGlobal = onSnapshot(query(globalRef), (snapshot) => {
+      const docs = snapshot.docs.map(d => ({
+        id: d.id,
+        ...d.data()
+      }));
+
+      const sorted = docs.sort((a, b) => b.xp - a.xp).slice(0, 10);
+      setLeaderboard(sorted);
+    });
+
+    return () => {
+      unsubUser();
+      unsubGlobal();
+    };
+  }, [user, showOnboarding]);
+
+  // ✅ CREATE ACCOUNT FIX
+  const handleCreateAccount = async (username, password) => {
+    if (!user) return;
+
+    if (!username || password.length < 4) {
+      alert("Invalid username or password");
+      return;
+    }
+
+    const initialStats = {
+      uid: user.uid,
+      username,
+      password,
+      xp: 0,
+      level: 1,
+      streak: 0,
+      totalEntries: 0,
+      joinedAt: new Date().toISOString()
+    };
+
+    await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'stats'), initialStats);
+
+    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'leaderboard', user.uid), {
+      uid: user.uid,
+      username,
+      xp: 0,
+      level: 1,
+      streak: 0
+    });
+
+    setShowOnboarding(false);
+  };
+
+  if (loading) return <div>Loading...</div>;
+  if (showOnboarding) return <Onboarding onCreate={handleCreateAccount} />;
+
+  return (
+    <div>
+      <h1>Vision Scribe</h1>
+
+      {view === 'dashboard' && <Dashboard userData={userData} />}
+      {view === 'verify' && <VerifySection userData={userData} user={user} setView={setView} />}
+      {view === 'leaderboard' && <Leaderboard leaderboard={leaderboard} />}
+    </div>
+  );
+}
+
+// ✅ DASHBOARD
+const Dashboard = ({ userData }) => {
+  if (!userData) return null;
+
+  return (
+    <div>
+      <h2>Hello {userData.username}</h2>
+      <p>XP: {userData.xp}</p>
+      <p>Level: {userData.level}</p>
+    </div>
+  );
+};
+
+// ✅ VERIFY (FULLY FIXED)
+const VerifySection = ({ userData, user, setView }) => {
+  const [image, setImage] = useState(null);
+  const [error, setError] = useState(null);
+
+  const fileInputRef = useRef();
+
+  const handleUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onloadend = () => setImage(reader.result);
+    reader.readAsDataURL(file);
+  };
+
+  const processVision = async () => {
+    try {
+      const base64 = image.split(',')[1];
+
+      const resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { text: "Return JSON: {valid:true/false, lines:number}" },
+                {
+                  inlineData: {
+                    mimeType: "image/jpeg",
+                    data: base64
+                  }
+                }
+              ]
+            }]
+          })
+        }
+      );
+
+      const data = await resp.json();
+
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) throw new Error("AI failed");
+
+      const analysis = JSON.parse(text);
+
+      if (!analysis.valid || analysis.lines < 8) {
+        throw new Error("Not enough writing");
+      }
+
+      const newXp = userData.xp + 40;
+      const newLevel = Math.floor(newXp / XP_PER_LEVEL) + 1;
+
+      await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'stats'), {
+        xp: newXp,
+        level: newLevel,
+        totalEntries: userData.totalEntries + 1
+      });
+
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'leaderboard', user.uid), {
+        xp: newXp,
+        level: newLevel
+      });
+
+      setView('dashboard');
+
+    } catch (e) {
+      console.error(e);
+      setError(e.message);
+    }
+  };
+
+  return (
+    <div>
+      <input type="file" ref={fileInputRef} onChange={handleUpload} />
+      <button onClick={processVision}>Verify</button>
+      {error && <p>{error}</p>}
+    </div>
+  );
+};
+
+// ✅ LEADERBOARD
+const Leaderboard = ({ leaderboard }) => (
+  <div>
+    <h2>Leaderboard</h2>
+    {leaderboard.map((u, i) => (
+      <div key={i}>
+        {u.username} - {u.xp}
+      </div>
+    ))}
+  </div>
+);
+
+// ✅ ONBOARDING
+const Onboarding = ({ onCreate }) => {
+  const [name, setName] = useState('');
+  const [pass, setPass] = useState('');
+
+  return (
+    <div>
+      <input placeholder="Username" onChange={e => setName(e.target.value)} />
+      <input placeholder="Password" onChange={e => setPass(e.target.value)} />
+      <button onClick={() => onCreate(name, pass)}>Create</button>
+    </div>
+  );
+};
